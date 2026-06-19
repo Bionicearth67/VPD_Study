@@ -1,0 +1,230 @@
+---
+title: "IgG Levels by Vaccine Dose and Age"
+author: "Stuart Torres, Ben Arnold"
+date: "Updated `r Sys.Date()`"
+format:
+  html:
+    toc: true
+    embed-resources: true
+    code-fold: true
+    link-external-newwindow: true
+---
+
+# Preamble
+
+```{r preamble, message=FALSE}
+library(here)
+source(here("R", "0-config.R"))
+```
+
+# Load and prepare data
+
+```{r load-data}
+#-------------------------------
+# read processed dataset
+#-------------------------------
+d0 <- read_rds(here("data", "ecomid_sero_vpd_2026-06-11.rds"))
+
+#-------------------------------
+# drop the 2 rows with missing
+# log10mfi (no antibody value)
+#-------------------------------
+n_drop_mfi <- sum(is.na(d0$log10mfi))
+d0 <- d0 %>% filter(!is.na(log10mfi))
+cat("Rows dropped for missing log10mfi:", n_drop_mfi, "\n")
+
+#-------------------------------
+# FLAG: implausible age(s). One sample has a negative age — the visit date
+# precedes the recorded DOB, so DOB or visit date is mis-entered. The age
+# axis below is limited to 6-24 months, which hides it; it is NOT removed
+# from the data pending review of the age calculation in script 1.
+#-------------------------------
+age_flags <- d0 %>%
+  filter(agemonths_best < 5) %>%
+  distinct(childid, timepoint, .keep_all = TRUE) %>%
+  select(sampleid, childid, timepoint, agedays_best, agemonths_best, dob, visitdate_best)
+cat("\nFLAGGED implausible-age child-visits (agemonths_best < 5):\n")
+print(as.data.frame(age_flags), row.names = FALSE)
+
+#-------------------------------
+# custom log10 axis labels
+# (convention from draft scripts)
+#-------------------------------
+log10labs <- c(
+  expression(10^0),
+  expression(10^1),
+  expression(10^2),
+  expression(10^3),
+  expression(10^4)
+)
+
+#-------------------------------
+# seropositivity thresholds (MFI-bg) pulled from the data
+#-------------------------------
+thresholds <- d0 %>%
+  distinct(pathogen, mficut) %>%
+  deframe()
+print(thresholds)
+
+#-------------------------------
+# dose-level color maps (shared with Fig 1B via 0-config.R).
+# Dose 0 (unvaccinated) is gray; doses 1-3 use high-contrast Dark2 hues —
+# warm (gold/orange/magenta) for pentavalent, cool (teal/purple) for MMR.
+#-------------------------------
+penta_cols <- penta_pal   # names "0".."3": gray + 3 warm hues
+mmr_cols   <- mmr_pal     # names "0".."2": gray + 2 cool hues
+```
+
+```{r panel-helpers}
+#-------------------------------
+# helper: jittered points + boxplot (drawn on top) of log10 IgG by cumulative
+# dose. Boxplots are unfilled (fill = NA) so points show through, narrow, and
+# layered over the jitter. (Used 4x across the two figures.)
+#-------------------------------
+make_dose_panel <- function(dat, dose_var, threshold, dose_cols, xlab, ylab, ylim) {
+  dat <- dat %>% mutate(dose_f = factor(.data[[dose_var]]))
+  ggplot(dat, aes(x = dose_f, y = log10mfi)) +
+    geom_jitter(aes(color = dose_f), width = 0.15, height = 0, alpha = 0.25) +
+    geom_boxplot(outliers = FALSE, fill = NA, width = 0.3, color = "gray20") +
+    geom_hline(yintercept = log10(threshold), linetype = "dashed") +
+    scale_color_manual(values = dose_cols, name = "Doses received", drop = FALSE) +
+    scale_y_continuous(breaks = 0:4, labels = log10labs) +
+    coord_cartesian(ylim = ylim) +
+    labs(x = xlab, y = ylab) +
+    # legend keys at full opacity even though plotted points are semi-transparent
+    guides(color = guide_legend(override.aes = list(alpha = 1, size = 2.5))) +
+    theme_minimal() +
+    theme(panel.grid.minor = element_blank())
+}
+
+#-------------------------------
+# helper: scatter of log10 IgG by exact age (colored by cumulative dose), with
+# an unfilled boxplot at each target visit age (grouped by timepoint) layered on
+# top to summarize the IgG distribution. Age axis limited to 6-24 months.
+#-------------------------------
+make_age_panel <- function(dat, dose_var, threshold, dose_cols, ylab, ylim) {
+  dat <- dat %>% mutate(dose_f = factor(.data[[dose_var]]))
+  ggplot(dat, aes(x = agemonths_best, y = log10mfi)) +
+    geom_point(aes(color = dose_f), alpha = 0.25) +
+    geom_boxplot(aes(x = timepoint, y = log10mfi, group = timepoint),
+                 inherit.aes = FALSE, outliers = FALSE, fill = NA,
+                 width = 1.5, color = "gray20") +
+    geom_hline(yintercept = log10(threshold), linetype = "dashed") +
+    scale_color_manual(values = dose_cols, name = "Doses received", drop = FALSE) +
+    scale_x_continuous(breaks = seq(6, 24, by = 3)) +
+    scale_y_continuous(breaks = 0:4, labels = log10labs) +
+    coord_cartesian(xlim = c(5, 25), ylim = ylim) +
+    labs(x = "Age at collection (months)", y = ylab) +
+    guides(color = guide_legend(override.aes = list(alpha = 1, size = 2.5))) +
+    theme_minimal() +
+    theme(panel.grid.minor = element_blank())
+}
+```
+
+---
+
+# Figure 4: Pentavalent vaccine — IgG by dose and age (tetanus, diphtheria)
+
+```{r fig4-data}
+#-------------------------------
+# tetanus and diphtheria; cumulative pentavalent doses
+# drop rows with missing penta_doses
+#-------------------------------
+d_tet  <- d0 %>% filter(pathogen == "Tetanus",    !is.na(penta_doses))
+d_diph <- d0 %>% filter(pathogen == "Diphtheria", !is.na(penta_doses))
+
+cat("Tetanus rows (penta_doses non-missing):",    nrow(d_tet),
+    "| dropped:", sum(d0$pathogen == "Tetanus")    - nrow(d_tet), "\n")
+cat("Diphtheria rows (penta_doses non-missing):", nrow(d_diph),
+    "| dropped:", sum(d0$pathogen == "Diphtheria") - nrow(d_diph), "\n")
+
+# common y-axis range across both pathogens in this figure
+penta_ylim <- range(c(d_tet$log10mfi, d_diph$log10mfi))
+```
+
+```{r fig4-plot, fig.width=9, fig.height=8, warning=FALSE}
+pA <- make_dose_panel(d_tet, "penta_doses", thresholds["Tetanus"],
+                      penta_cols, "Pentavalent doses received",
+                      "Tetanus IgG (MFI-bg)", penta_ylim)
+pB <- make_age_panel(d_tet, "penta_doses", thresholds["Tetanus"],
+                     penta_cols, NULL, penta_ylim)
+pC <- make_dose_panel(d_diph, "penta_doses", thresholds["Diphtheria"],
+                      penta_cols, "Pentavalent doses received",
+                      "Diphtheria IgG (MFI-bg)", penta_ylim)
+pD <- make_age_panel(d_diph, "penta_doses", thresholds["Diphtheria"],
+                     penta_cols, NULL, penta_ylim)
+
+fig4 <- (pA | pB) / (pC | pD) +
+  plot_layout(guides = "collect") +
+  plot_annotation(tag_levels = "A") &
+  theme(legend.position = "bottom", plot.tag = element_text(face = "bold"))
+
+fig4
+
+ggsave(
+  filename = here("output", "figures", "fig4_IgG_dose_age_pentavalent.png"),
+  plot = fig4,
+  width = 200, height = 180, units = "mm", dpi = 300
+)
+cat("Figure 4 saved.\n")
+```
+
+---
+
+# Figure 5: MMR vaccine — IgG by dose and age (rubella, measles)
+
+```{r fig5-data}
+#-------------------------------
+# rubella and measles; cumulative MMR doses
+# drop rows with missing mmr_doses
+#-------------------------------
+d_rub <- d0 %>% filter(pathogen == "Rubella", !is.na(mmr_doses))
+d_mea <- d0 %>% filter(pathogen == "Measles", !is.na(mmr_doses))
+
+cat("Rubella rows (mmr_doses non-missing):", nrow(d_rub),
+    "| dropped:", sum(d0$pathogen == "Rubella") - nrow(d_rub), "\n")
+cat("Measles rows (mmr_doses non-missing):", nrow(d_mea),
+    "| dropped:", sum(d0$pathogen == "Measles") - nrow(d_mea), "\n")
+
+# confirm MMR dose levels present (spec: confirm whether dose = 3 exists)
+cat("\nMMR dose levels present:\n")
+print(sort(unique(c(d_rub$mmr_doses, d_mea$mmr_doses))))
+
+# common y-axis range across both pathogens in this figure
+mmr_ylim <- range(c(d_rub$log10mfi, d_mea$log10mfi))
+```
+
+```{r fig5-plot, fig.width=9, fig.height=8, warning=FALSE}
+qA <- make_dose_panel(d_rub, "mmr_doses", thresholds["Rubella"],
+                      mmr_cols, "MMR doses received",
+                      "Rubella IgG (MFI-bg)", mmr_ylim)
+qB <- make_age_panel(d_rub, "mmr_doses", thresholds["Rubella"],
+                     mmr_cols, NULL, mmr_ylim)
+qC <- make_dose_panel(d_mea, "mmr_doses", thresholds["Measles"],
+                      mmr_cols, "MMR doses received",
+                      "Measles IgG (MFI-bg)", mmr_ylim)
+qD <- make_age_panel(d_mea, "mmr_doses", thresholds["Measles"],
+                     mmr_cols, NULL, mmr_ylim)
+
+fig5 <- (qA | qB) / (qC | qD) +
+  plot_layout(guides = "collect") +
+  plot_annotation(tag_levels = "A") &
+  theme(legend.position = "bottom", plot.tag = element_text(face = "bold"))
+
+fig5
+
+ggsave(
+  filename = here("output", "figures", "fig5_IgG_dose_age_MMR.png"),
+  plot = fig5,
+  width = 200, height = 180, units = "mm", dpi = 300
+)
+cat("Figure 5 saved.\n")
+```
+
+---
+
+# Session information
+
+```{r session-info}
+sessionInfo()
+```

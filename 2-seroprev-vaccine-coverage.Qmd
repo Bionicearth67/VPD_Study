@@ -1,0 +1,953 @@
+---
+title: "Seroprevalence and Vaccination Coverage"
+author: "Stuart Torres, Ben Arnold"
+date: "Updated `r Sys.Date()`"
+project:
+  output-dir: output
+format:
+  html:
+    toc: true
+    embed-resources: true
+    code-fold: true
+    link-external-newwindow: true
+---
+
+# Preamble
+
+```{r preamble, message=FALSE}
+library(here)
+source(here("R", "0-config.R"))
+```
+
+# Load and prepare data
+
+```{r load-data}
+#-------------------------------
+# read processed dataset
+#-------------------------------
+d0 <- read_rds(here("data", "ecomid_sero_vpd_2026-06-11.rds"))
+
+#-------------------------------
+# collapse 4-level community_type to 3 levels
+# Esmeraldas City | Borbon | Rural Villages
+# using community_name as the source of truth
+#-------------------------------
+d0 <- d0 %>%
+  mutate(
+    community_type_3 = case_when(
+      community_name == "Esmeraldas" ~ "Esmeraldas City",
+      community_name == "Borbon"     ~ "Borbon",
+      TRUE                           ~ "Rural Villages"
+    ),
+    community_type_3 = factor(community_type_3,
+                               levels = c("Esmeraldas City", "Borbon", "Rural Villages")),
+    pathogen = factor(pathogen,
+                      levels = c("Tetanus", "Diphtheria", "Rubella", "Measles")),
+    timepoint = as.integer(timepoint),
+    timept_f  = factor(timepoint, levels = c(6, 9, 12, 18, 24))
+  )
+
+cat("Total rows:", nrow(d0), "\n")
+cat("Unique children:", n_distinct(d0$childid), "\n")
+cat("Unique child-visits (per pathogen):", n_distinct(d0$childid, d0$timepoint), "\n")
+```
+
+```{r helpers}
+#-------------------------------
+# helper: compute exact binomial CI and format cell text
+# used in all seroprevalence and coverage tables (7+ tables)
+#-------------------------------
+add_binom_ci <- function(df) {
+  df %>%
+    rowwise() %>%
+    mutate(
+      prev_pct = if_else(n_test > 0, n_pos / n_test * 100, NA_real_),
+      ci_lo    = if_else(n_test > 0, binom.test(n_pos, n_test)$conf.int[1] * 100, NA_real_),
+      ci_hi    = if_else(n_test > 0, binom.test(n_pos, n_test)$conf.int[2] * 100, NA_real_),
+      cell     = if_else(
+        n_test > 0,
+        sprintf("%d/%d (%.1f%%) [%.1f, %.1f]", n_pos, n_test, prev_pct, ci_lo, ci_hi),
+        "0/0 (—)"
+      )
+    ) %>%
+    ungroup()
+}
+
+#-------------------------------
+# helper: compute seroprevalence cells for one pathogen
+# returns long-format with timepoint_lbl and community_type_3
+#-------------------------------
+seroprev_cells <- function(data, pathogen_name) {
+  dp <- data %>% filter(pathogen == pathogen_name)
+
+  # by community × timepoint
+  by_ct <- dp %>%
+    group_by(community_type_3, timepoint) %>%
+    summarise(n_pos = sum(seropos, na.rm = TRUE),
+              n_test = sum(!is.na(seropos)), .groups = "drop")
+
+  # overall column: pool across communities, by timepoint
+  by_t <- dp %>%
+    group_by(timepoint) %>%
+    summarise(n_pos = sum(seropos, na.rm = TRUE),
+              n_test = sum(!is.na(seropos)), .groups = "drop") %>%
+    mutate(community_type_3 = factor("Overall"))
+
+  # overall row: pool across timepoints, by community
+  by_c <- dp %>%
+    group_by(community_type_3) %>%
+    summarise(n_pos = sum(seropos, na.rm = TRUE),
+              n_test = sum(!is.na(seropos)), .groups = "drop") %>%
+    mutate(timepoint = 0L)
+
+  # grand total
+  grand <- dp %>%
+    summarise(n_pos = sum(seropos, na.rm = TRUE),
+              n_test = sum(!is.na(seropos))) %>%
+    mutate(community_type_3 = factor("Overall"), timepoint = 0L)
+
+  bind_rows(by_ct, by_t, by_c, grand) %>%
+    add_binom_ci() %>%
+    mutate(timepoint_lbl = if_else(timepoint == 0L, "Overall",
+                                   paste0(timepoint, " months")))
+}
+
+#-------------------------------
+# helper: compute vaccine coverage cells for one dose indicator
+# vacc_var: character name of visit-specific vaccination variable (e.g. "penta1_visit")
+# dose_label: label for this dose (e.g. "Penta 1")
+#-------------------------------
+coverage_cells <- function(data, vacc_var, dose_label) {
+  dc <- data %>%
+    mutate(
+      vacc = if_else(.data[[vacc_var]] == "YES", 1L, 0L)
+    )
+
+  by_ct <- dc %>%
+    group_by(community_type_3, timepoint) %>%
+    summarise(n_pos = sum(vacc, na.rm = TRUE),
+              n_test = sum(!is.na(vacc)), .groups = "drop")
+
+  by_t <- dc %>%
+    group_by(timepoint) %>%
+    summarise(n_pos = sum(vacc, na.rm = TRUE),
+              n_test = sum(!is.na(vacc)), .groups = "drop") %>%
+    mutate(community_type_3 = factor("Overall"))
+
+  by_c <- dc %>%
+    group_by(community_type_3) %>%
+    summarise(n_pos = sum(vacc, na.rm = TRUE),
+              n_test = sum(!is.na(vacc)), .groups = "drop") %>%
+    mutate(timepoint = 0L)
+
+  grand <- dc %>%
+    summarise(n_pos = sum(vacc, na.rm = TRUE),
+              n_test = sum(!is.na(vacc))) %>%
+    mutate(community_type_3 = factor("Overall"), timepoint = 0L)
+
+  bind_rows(by_ct, by_t, by_c, grand) %>%
+    add_binom_ci() %>%
+    mutate(timepoint_lbl = if_else(timepoint == 0L, "Overall",
+                                   paste0(timepoint, " months")),
+           dose = dose_label)
+}
+
+#-------------------------------
+# helper: pivot long cells to display-ready wide table
+# id_col: row label column
+# name_col: column to pivot on
+# value_col: cell text column
+# col_order: desired column order after pivot
+#-------------------------------
+pivot_wide_table <- function(df, id_col, name_col, value_col, col_order) {
+  df %>%
+    select(all_of(c(id_col, name_col, value_col))) %>%
+    pivot_wider(names_from = all_of(name_col), values_from = all_of(value_col)) %>%
+    select(all_of(id_col), any_of(col_order))
+}
+
+comm_col_order <- c("Esmeraldas City", "Borbon", "Rural Villages", "Overall")
+```
+
+---
+
+# Table 1a: Household and participant characteristics
+
+```{r table-1a}
+#-------------------------------
+# load survey data and join to
+# child-level community info from serology
+#-------------------------------
+survey <- read_csv(here("data", "surveydata_20251003.csv"), show_col_types = FALSE)
+
+child_comm <- d0 %>%
+  distinct(childid, house_ID, community_type_3)
+
+hh <- child_comm %>% 
+  left_join(survey, by = "house_ID")
+
+cat("Children in serology data:", n_distinct(child_comm$childid), "\n")
+cat("Children matched to survey:", sum(!is.na(hh$momage)), "\n")
+
+#-------------------------------
+# factor coding for table1
+#-------------------------------
+hh <- hh %>%
+  mutate(
+    sex_child = factor(
+      # use sexo_nino from survey
+      sexo_nino,
+      levels = c(1, 2),
+      labels = c("Male", "Female")
+    ),
+    mom_ethnicity = factor(
+      mom_ethnicity,
+      levels = c(1, 2, 3, 4, 888),
+      labels = c("Afro-Ecuadorian", "Chachi", "Mestizo", "Manabí", "Other")
+    ),
+    momedu_cat = factor(
+      momedu_cat,
+      levels = c("Primary or less", "Lower secondary",
+                 "Upper secondary", "Post-secondary or greater")
+    ),
+    birthorder = factor(
+      birthorder,
+      levels = c("1", "2", "3+"),
+      labels = c("First", "Second", "Third or later")
+    ),
+    hhcrowd = factor(
+      hhcrowd,
+      levels = c(0, 1),
+      labels = c("< 3 persons/room", "≥ 3 persons/room")
+    ),
+    hhwealthquart = factor(
+      hhwealthquart,
+      levels = c(1, 2, 3, 4),
+      labels = c("Q1 (lowest)", "Q2", "Q3", "Q4 (highest)")
+    )
+  )
+
+label(hh$momage)        <- "Maternal age at childbirth (years)"
+label(hh$mom_ethnicity) <- "Maternal ethnicity"
+label(hh$momedu_cat)    <- "Maternal education"
+label(hh$birthorder)    <- "Birth order"
+label(hh$sex_child)     <- "Child sex"
+label(hh$hhcrowd)       <- "Household crowding"
+label(hh$hhwealthquart) <- "Wealth quartile"
+
+t1a <- table1(
+  ~ momage + mom_ethnicity + momedu_cat + birthorder +
+    sex_child + hhcrowd + hhwealthquart | community_type_3,
+  data = hh,
+  overall = "Overall"
+)
+t1a
+
+#-------------------------------
+# save CSV version
+#-------------------------------
+t1a_df <- as.data.frame(t1a)
+write_csv(t1a_df, here("output", "tables", "table1a_household_characteristics.csv"))
+cat("Table 1a saved:", nrow(t1a_df), "rows\n")
+```
+
+---
+
+# Table 1b: Cohort DBS and vaccination coverage summary
+
+```{r table-1b}
+#-------------------------------
+# child-level summary (sex, community, DBS count, age at first DBS)
+#-------------------------------
+# add in sexo_nino from survey data
+d0 <- d0 %>% 
+  left_join(survey %>% select(house_ID, sexo_nino), by = "house_ID",  relationship = "many-to-one")
+
+child_sum <- d0 %>%
+  filter(pathogen == "Tetanus") %>%         # one row per child-visit
+  group_by(childid) %>%
+  summarise(
+    community_type_3  = first(community_type_3),
+    sex               = first(sexo_nino),
+    n_dbs             = n_distinct(timepoint),
+    age_first_dbs_mo  = min(agemonths_best, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    sex_lbl = factor(sex, levels = c(1, 2), labels = c("Male", "Female"))
+  )
+
+cat("Sex distribution:\n"); print(table(child_sum$sex_lbl))
+cat("\nDBS per child — median:", median(child_sum$n_dbs),
+    "IQR:", paste(quantile(child_sum$n_dbs, c(0.25, 0.75)), collapse = "–"), "\n")
+cat("Age at first DBS (months) — median:", round(median(child_sum$age_first_dbs_mo), 1),
+    "IQR:", paste(round(quantile(child_sum$age_first_dbs_mo, c(0.25, 0.75)), 1), collapse = "–"), "\n")
+
+#-------------------------------
+# vaccination coverage by timepoint and vaccine
+# using visit-level indicators (dose received prior to DBS collection)
+# denominator: children with non-missing visit-specific vaccination info
+#-------------------------------
+d_vax <- d0 %>%
+  filter(pathogen == "Tetanus") %>%   # unique child-visit rows; vax vars same across pathogens
+  mutate(
+    penta_any_n = if_else(penta1_visit == "YES", 1L, 0L),   # ≥1 penta dose (tetanus/diphtheria)
+    mmr_any_n   = if_else(mmr1_visit   == "YES", 1L, 0L)    # ≥1 MMR dose  (rubella/measles)
+  )
+
+cov_by_tp <- d_vax %>%
+  group_by(timepoint) %>%
+  summarise(
+    penta_n_vacc  = sum(penta_any_n, na.rm = TRUE),
+    penta_n_rec   = sum(!is.na(penta_any_n)),
+    mmr_n_vacc    = sum(mmr_any_n, na.rm = TRUE),
+    mmr_n_rec     = sum(!is.na(mmr_any_n)),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    penta_pct = penta_n_vacc / penta_n_rec * 100,
+    mmr_pct   = mmr_n_vacc   / mmr_n_rec   * 100,
+    penta_cell = sprintf("%d/%d (%.1f%%)", penta_n_vacc, penta_n_rec, penta_pct),
+    mmr_cell   = sprintf("%d/%d (%.1f%%)", mmr_n_vacc,   mmr_n_rec,   mmr_pct)
+  )
+
+#-------------------------------
+# assemble Table 1b
+#-------------------------------
+t1b_rows <- tibble(
+  Characteristic = c(
+    "Children enrolled, n",
+    "Sex, n (%)",
+    "  Male",
+    "  Female",
+    "Community type, n (%)",
+    "  Esmeraldas City",
+    "  Borbon",
+    "  Rural Villages",
+    "DBS samples per child, median (IQR)",
+    "Age at first DBS (months), median (IQR)",
+    "Vaccination coverage at each age — ≥1 pentavalent dose (tetanus / diphtheria)",
+    paste0("  Age ", cov_by_tp$timepoint, " months: ", cov_by_tp$penta_cell),
+    "Vaccination coverage at each age — ≥1 MMR dose (rubella / measles)",
+    paste0("  Age ", cov_by_tp$timepoint, " months: ", cov_by_tp$mmr_cell)
+  )
+)
+
+n_total    <- n_distinct(child_sum$childid)
+n_male     <- sum(child_sum$sex_lbl == "Male", na.rm = TRUE)
+n_female   <- sum(child_sum$sex_lbl == "Female", na.rm = TRUE)
+n_esm      <- sum(child_sum$community_type_3 == "Esmeraldas City")
+n_bor      <- sum(child_sum$community_type_3 == "Borbon")
+n_rur      <- sum(child_sum$community_type_3 == "Rural Villages")
+dbs_med    <- median(child_sum$n_dbs)
+dbs_iqr    <- quantile(child_sum$n_dbs, c(0.25, 0.75))
+age_med    <- round(median(child_sum$age_first_dbs_mo), 1)
+age_iqr    <- round(quantile(child_sum$age_first_dbs_mo, c(0.25, 0.75)), 1)
+
+t1b <- tibble(
+  Characteristic = c(
+    "Children enrolled, n",
+    "Sex, n (%)",
+    sprintf("  Male, n (%%)"),
+    sprintf("  Female, n (%%)"),
+    "Community type, n (%)",
+    "  Esmeraldas City",
+    "  Borbon",
+    "  Rural Villages",
+    "DBS samples per child, median (IQR)",
+    "Age at first DBS (months), median (IQR)"
+  ),
+  Value = c(
+    as.character(n_total),
+    "",
+    sprintf("%d (%.1f%%)", n_male,   n_male / n_total * 100),
+    sprintf("%d (%.1f%%)", n_female, n_female / n_total * 100),
+    "",
+    sprintf("%d (%.1f%%)", n_esm, n_esm / n_total * 100),
+    sprintf("%d (%.1f%%)", n_bor, n_bor / n_total * 100),
+    sprintf("%d (%.1f%%)", n_rur, n_rur / n_total * 100),
+    sprintf("%d (%d–%d)",  dbs_med, dbs_iqr[1], dbs_iqr[2]),
+    sprintf("%.1f (%.1f–%.1f)", age_med, age_iqr[1], age_iqr[2])
+  )
+)
+
+# append vaccination coverage rows
+cov_penta_rows <- tibble(
+  Characteristic = c(
+    "Vaccination coverage — ≥1 pentavalent dose received by visit (tetanus, diphtheria)^a^",
+    paste0("  Age ", cov_by_tp$timepoint, " months")
+  ),
+  Value = c("", cov_by_tp$penta_cell)
+)
+
+cov_mmr_rows <- tibble(
+  Characteristic = c(
+    "Vaccination coverage — ≥1 MMR dose received by visit (rubella, measles)^a^",
+    paste0("  Age ", cov_by_tp$timepoint, " months")
+  ),
+  Value = c("", cov_by_tp$mmr_cell)
+)
+
+t1b_full <- bind_rows(t1b, cov_penta_rows, cov_mmr_rows)
+
+write_csv(t1b_full, here("output", "tables", "table1b_cohort_summary.csv"))
+cat("Table 1b saved:", nrow(t1b_full), "rows\n")
+
+t1b_full %>%
+  gt() %>%
+  tab_header(title = "Table 1b. Cohort Summary") %>%
+  tab_footnote("^a^ Coverage = n with ≥1 dose received before the DBS collection visit / n attending with vaccination information available (%). Vaccination records may be missing for some visits.") %>%
+  cols_label(Characteristic = "Characteristic", Value = "Overall")
+```
+
+---
+
+# Tables 2–5: Seroprevalence by age and community type
+
+```{r seroprev-tables, results='asis'}
+for (pg in levels(d0$pathogen)) {
+
+  sp_long <- seroprev_cells(d0, pg)
+
+  # wide table: rows = timepoint, columns = community
+  sp_wide <- sp_long %>%
+    mutate(community_type_3 = as.character(community_type_3)) %>%
+    pivot_wide_table("timepoint_lbl", "community_type_3", "cell", comm_col_order)
+
+  # row order
+  row_order <- c("6 months", "9 months", "12 months", "18 months", "24 months", "Overall")
+  sp_wide <- sp_wide %>%
+    mutate(timepoint_lbl = factor(timepoint_lbl, levels = row_order)) %>%
+    arrange(timepoint_lbl)
+
+  # save CSV (long format with all metrics)
+  sp_csv <- sp_long %>%
+    mutate(
+      community_type_3 = as.character(community_type_3),
+      pathogen_name = pg
+    ) %>%
+    select(pathogen_name, timepoint_lbl, community_type_3,
+           n_pos, n_test, prev_pct, ci_lo, ci_hi, cell)
+
+  tbl_num <- which(levels(d0$pathogen) == pg) + 1
+  fname   <- sprintf("table%d_seroprev_%s.csv", tbl_num, tolower(pg))
+  write_csv(sp_csv, here("output", "tables", fname))
+  cat("Saved:", fname, "—", nrow(sp_csv), "rows\n")
+
+  # display
+  gt_tbl <- sp_wide %>%
+    gt(rowname_col = "timepoint_lbl") %>%
+    tab_header(title = sprintf("Table %d. %s IgG seroprevalence by age and community", tbl_num, pg)) %>%
+    tab_stubhead(label = "Age group") %>%
+    tab_footnote(
+      "Cell: n seropositive / n tested (%) [95% exact binomial CI]. Overall row pools across all visit ages; overall column pools across all communities. Repeated-measures structure not accounted for in pooled rows/columns."
+    )
+
+  print(gt_tbl)
+  cat("\n\n")
+}
+```
+
+---
+
+# Tables 6–7: Vaccination coverage by dose, age, and community type
+
+```{r coverage-tables}
+#-------------------------------
+# vaccination dataset: one row per child-visit (filter to one pathogen)
+# vaccination variables are identical across pathogens
+#-------------------------------
+d_cov <- d0 %>% filter(pathogen == "Tetanus")
+
+#-------------------------------
+# Table 6: Pentavalent vaccine (Penta 1, 2, 3)
+#-------------------------------
+penta_doses <- list(
+  "Penta 1" = "penta1_visit",
+  "Penta 2" = "penta2_visit",
+  "Penta 3" = "penta3_visit"
+)
+
+t6_long <- map_dfr(names(penta_doses), function(dose_lbl) {
+  coverage_cells(d_cov, penta_doses[[dose_lbl]], dose_lbl)
+})
+
+# row order
+row_order <- c("6 months", "9 months", "12 months", "18 months", "24 months", "Overall")
+
+t6_wide <- t6_long %>%
+  mutate(community_type_3 = as.character(community_type_3)) %>%
+  pivot_wide_table("timepoint_lbl", "community_type_3", "cell", comm_col_order) %>%
+  mutate(
+    timepoint_lbl = factor(timepoint_lbl, levels = row_order),
+    dose = t6_long$dose[match(timepoint_lbl, t6_long$timepoint_lbl)]
+  )
+
+# re-derive dose column after pivot (pivot drops it)
+t6_wide <- t6_long %>%
+  mutate(community_type_3 = as.character(community_type_3)) %>%
+  select(dose, timepoint_lbl, community_type_3, cell) %>%
+  pivot_wider(names_from = community_type_3, values_from = cell) %>%
+  select(dose, timepoint_lbl, any_of(comm_col_order)) %>%
+  mutate(timepoint_lbl = factor(timepoint_lbl, levels = row_order)) %>%
+  arrange(dose, timepoint_lbl)
+
+# CSV (long)
+t6_csv <- t6_long %>%
+  mutate(community_type_3 = as.character(community_type_3)) %>%
+  select(dose, timepoint_lbl, community_type_3, n_pos, n_test, prev_pct, ci_lo, ci_hi, cell)
+write_csv(t6_csv, here("output", "tables", "table6_coverage_pentavalent.csv"))
+cat("Table 6 saved:", nrow(t6_csv), "rows\n")
+
+# display
+t6_wide %>%
+  gt(rowname_col = "timepoint_lbl", groupname_col = "dose") %>%
+  tab_header(title = "Table 6. Pentavalent vaccine coverage by dose, age, and community") %>%
+  tab_stubhead(label = "Age group") %>%
+  tab_footnote(
+    "Cell: n vaccinated / n with vaccination record (%) [95% exact binomial CI]. Vaccinated = dose received prior to DBS collection visit. Overall row pools across all visit ages."
+  )
+```
+
+```{r table7}
+#-------------------------------
+# Table 7: MMR vaccine (MMR 1, MMR 2)
+#-------------------------------
+mmr_doses <- list(
+  "MMR 1" = "mmr1_visit",
+  "MMR 2" = "mmr2_visit"
+)
+
+t7_long <- map_dfr(names(mmr_doses), function(dose_lbl) {
+  coverage_cells(d_cov, mmr_doses[[dose_lbl]], dose_lbl)
+})
+
+t7_wide <- t7_long %>%
+  mutate(community_type_3 = as.character(community_type_3)) %>%
+  select(dose, timepoint_lbl, community_type_3, cell) %>%
+  pivot_wider(names_from = community_type_3, values_from = cell) %>%
+  select(dose, timepoint_lbl, any_of(comm_col_order)) %>%
+  mutate(timepoint_lbl = factor(timepoint_lbl, levels = row_order)) %>%
+  arrange(dose, timepoint_lbl)
+
+t7_csv <- t7_long %>%
+  mutate(community_type_3 = as.character(community_type_3)) %>%
+  select(dose, timepoint_lbl, community_type_3, n_pos, n_test, prev_pct, ci_lo, ci_hi, cell)
+write_csv(t7_csv, here("output", "tables", "table7_coverage_mmr.csv"))
+cat("Table 7 saved:", nrow(t7_csv), "rows\n")
+
+t7_wide %>%
+  gt(rowname_col = "timepoint_lbl", groupname_col = "dose") %>%
+  tab_header(title = "Table 7. MMR vaccine coverage by dose, age, and community") %>%
+  tab_stubhead(label = "Age group") %>%
+  tab_footnote(
+    "Cell: n vaccinated / n with vaccination record (%) [95% exact binomial CI]. Vaccinated = dose received prior to DBS collection visit. Overall row pools across all visit ages."
+  )
+```
+
+---
+
+# Figure 1: Seroprevalence and vaccination coverage by age (overall)
+
+```{r fig1-data}
+#-------------------------------
+# Panel A data: seroprevalence by age (overall, all 4 pathogens)
+#-------------------------------
+
+# colors follow Stuart's draft: Tetanus=cbpal[4], Diphtheria=cbpal[2],
+#   Rubella=cbpal[3], Measles=cbpal[8]
+pathogen_colors <- c(
+  "Tetanus"    = cbpal[7],   # red    — pentavalent-preventable (warm)
+  "Diphtheria" = cbpal[2],   # orange — pentavalent-preventable (warm)
+  "Rubella"    = cbpal[3],   # light blue — MMR-preventable (cool)
+  "Measles"    = cbpal[6]    # dark blue  — MMR-preventable (cool)
+)
+
+sp_overall <- d0 %>%
+  group_by(pathogen, timepoint) %>%
+  summarise(
+    n_pos  = sum(seropos, na.rm = TRUE),
+    n_test = sum(!is.na(seropos)),
+    .groups = "drop"
+  ) %>%
+  add_binom_ci()
+
+#-------------------------------
+# Panel B data: vaccination coverage by dose and age (all 5 doses)
+#-------------------------------
+dose_vars <- list(
+  "Penta 1" = "penta1_visit",
+  "Penta 2" = "penta2_visit",
+  "Penta 3" = "penta3_visit",
+  "MMR 1"   = "mmr1_visit",
+  "MMR 2"   = "mmr2_visit"
+)
+
+cov_overall <- map_dfr(names(dose_vars), function(dose_lbl) {
+  d_cov %>%
+    mutate(vacc = if_else(.data[[dose_vars[[dose_lbl]]]] == "YES", 1L, 0L)) %>%
+    group_by(timepoint) %>%
+    summarise(
+      n_pos  = sum(vacc, na.rm = TRUE),
+      n_test = sum(!is.na(vacc)),
+      .groups = "drop"
+    ) %>%
+    mutate(dose = dose_lbl)
+}) %>%
+  add_binom_ci()
+
+# factor doses in anticipated coverage order at 24 months (Penta 1 highest, MMR 2 lowest)
+cov_24 <- cov_overall %>%
+  filter(timepoint == 24) %>%
+  arrange(desc(prev_pct)) %>%
+  pull(dose)
+cov_overall <- cov_overall %>%
+  mutate(dose = factor(dose, levels = cov_24))
+
+dose_colors <- c(
+  "Penta 1" = penta_pal[["1"]],
+  "Penta 2" = penta_pal[["2"]],
+  "Penta 3" = penta_pal[["3"]],
+  "MMR 1"   = mmr_pal[["1"]],
+  "MMR 2"   = mmr_pal[["2"]]
+)
+```
+
+```{r fig1-plot, fig.width=8, fig.height=8}
+pd <- position_dodge(width = 0.3)
+
+panel_a <- sp_overall %>%
+  ggplot(aes(x = timepoint, y = prev_pct, color = pathogen, group = pathogen)) +
+  geom_linerange(aes(ymin = ci_lo, ymax = ci_hi), position = pd) +
+  geom_point(size = 2, position = pd) +
+  geom_line(position = pd) +
+  scale_color_manual(values = pathogen_colors, name = NULL) +
+  scale_x_continuous(breaks = seq(6, 24, by = 3)) +
+  scale_y_continuous(breaks = seq(0, 100, 20), limits = c(0, 100)) +
+  labs(x = "Age (months)", y = "Seroprevalence (%)") +
+  theme_minimal() +
+  theme(panel.grid.minor.x = element_blank(),
+        legend.position = "bottom")
+
+panel_b <- cov_overall %>%
+  ggplot(aes(x = timepoint, y = prev_pct,
+             color = dose, group = dose)) +
+  geom_linerange(aes(ymin = ci_lo, ymax = ci_hi), position = pd) +
+  geom_point(size = 2, position = pd) +
+  geom_line(position = pd) +
+  scale_color_manual(values = dose_colors, name = "Dose") +
+  scale_x_continuous(breaks = seq(6, 24, by = 3)) +
+  scale_y_continuous(breaks = seq(0, 100, 20), limits = c(0, 100)) +
+  labs(x = "Age (months)", y = "Vaccination coverage (%)") +
+  guides(color = guide_legend(nrow = 2, byrow = TRUE)) +   # Penta row / MMR row
+  theme_minimal() +
+  theme(panel.grid.minor.x = element_blank(),
+        legend.position = "bottom")
+
+# aspect.ratio = 1 makes each panel's plotting region square (≈1:1), matching
+# the panel proportions in Figures 2 and 3
+fig1 <- (panel_a / panel_b) +
+  plot_annotation(tag_levels = "A") &
+  theme(aspect.ratio = 1, plot.tag = element_text(face = "bold"))
+
+fig1
+
+ggsave(
+  filename = here("output", "figures", "fig1_seroprev_coverage_byage.png"),
+  plot = fig1,
+  width = 130, height = 240, units = "mm", dpi = 300
+)
+cat("Figure 1 saved.\n")
+```
+
+---
+
+# Figure 2: Seroprevalence by age and community type
+
+```{r fig2-data}
+sp_comm <- d0 %>%
+  group_by(pathogen, community_type_3, timepoint) %>%
+  summarise(
+    n_pos  = sum(seropos, na.rm = TRUE),
+    n_test = sum(!is.na(seropos)),
+    .groups = "drop"
+  ) %>%
+  add_binom_ci()
+
+# urban -> rural gradient: city = red, Borbon = blue, rural = green (forest).
+# red and green are non-adjacent (blue between them) in the ordered legend.
+comm_colors <- c(
+  "Esmeraldas City" = cbpal[7],   # red
+  "Borbon"          = cbpal[6],   # blue
+  "Rural Villages"  = cbpal[4]    # green (rainforest)
+)
+# legend order: urban -> rural
+comm_breaks <- c("Esmeraldas City", "Borbon", "Rural Villages")
+```
+
+```{r fig2-plot, fig.width=9, fig.height=8}
+make_comm_panel <- function(data, pathogen_name) {
+  data %>%
+    filter(pathogen == pathogen_name) %>%
+    ggplot(aes(x = timepoint, y = prev_pct,
+               color = community_type_3, group = community_type_3)) +
+    geom_linerange(aes(ymin = ci_lo, ymax = ci_hi)) +
+    geom_point(size = 2) +
+    geom_line() +
+    scale_color_manual(values = comm_colors, breaks = comm_breaks,
+                       name = NULL) +
+    scale_x_continuous(breaks = seq(6, 24, by = 3)) +
+    scale_y_continuous(breaks = seq(0, 100, 20), limits = c(0, 100)) +
+    labs(x = "Age (months)", y = "Seroprevalence (%)",
+         title = pathogen_name) +
+    theme_minimal() +
+    theme(panel.grid.minor.x = element_blank())
+}
+
+p_tet  <- make_comm_panel(sp_comm, "Tetanus")
+p_diph <- make_comm_panel(sp_comm, "Diphtheria")
+p_rub  <- make_comm_panel(sp_comm, "Rubella")
+p_mea  <- make_comm_panel(sp_comm, "Measles")
+
+fig2 <- (p_tet | p_diph) / (p_rub | p_mea) +
+  plot_layout(guides = "collect") +
+  plot_annotation(tag_levels = "A") &
+  theme(legend.position = "bottom", legend.direction = "horizontal",
+        plot.tag = element_text(face = "bold"))
+
+fig2
+
+ggsave(
+  filename = here("output", "figures", "fig2_seroprev_bycommunity.png"),
+  plot = fig2,
+  width = 200, height = 180, units = "mm", dpi = 300
+)
+cat("Figure 2 saved.\n")
+```
+
+---
+
+# Figure 3: Vaccination coverage by dose and community type
+
+```{r fig3-data}
+cov_comm <- map_dfr(names(dose_vars), function(dose_lbl) {
+  d_cov %>%
+    mutate(vacc = if_else(.data[[dose_vars[[dose_lbl]]]] == "YES", 1L, 0L)) %>%
+    group_by(community_type_3, timepoint) %>%
+    summarise(
+      n_pos  = sum(vacc, na.rm = TRUE),
+      n_test = sum(!is.na(vacc)),
+      .groups = "drop"
+    ) %>%
+    mutate(dose = dose_lbl)
+}) %>%
+  add_binom_ci()
+```
+
+```{r fig3-plot, fig.width=11, fig.height=8}
+make_dose_panel <- function(data, dose_name) {
+  data %>%
+    filter(dose == dose_name) %>%
+    ggplot(aes(x = timepoint, y = prev_pct,
+               color = community_type_3, group = community_type_3)) +
+    geom_linerange(aes(ymin = ci_lo, ymax = ci_hi)) +
+    geom_point(size = 2) +
+    geom_line() +
+    scale_color_manual(values = comm_colors, breaks = comm_breaks,
+                       name = NULL) +
+    scale_x_continuous(breaks = seq(6, 24, by = 3)) +
+    scale_y_continuous(breaks = seq(0, 100, 20), limits = c(0, 100)) +
+    labs(x = "Age (months)", y = "Coverage (%)",
+         title = sprintf("Pentavalent dose %s",
+                         gsub("Penta ", "", dose_name))) +
+    theme_minimal() +
+    theme(panel.grid.minor.x = element_blank())
+}
+
+make_mmr_panel <- function(data, dose_name) {
+  data %>%
+    filter(dose == dose_name) %>%
+    ggplot(aes(x = timepoint, y = prev_pct,
+               color = community_type_3, group = community_type_3)) +
+    geom_linerange(aes(ymin = ci_lo, ymax = ci_hi)) +
+    geom_point(size = 2) +
+    geom_line() +
+    scale_color_manual(values = comm_colors, breaks = comm_breaks,
+                       name = NULL) +
+    scale_x_continuous(breaks = seq(6, 24, by = 3)) +
+    scale_y_continuous(breaks = seq(0, 100, 20), limits = c(0, 100)) +
+    labs(x = "Age (months)", y = "Coverage (%)",
+         title = sprintf("MMR dose %s", gsub("MMR ", "", dose_name))) +
+    theme_minimal() +
+    theme(panel.grid.minor.x = element_blank())
+}
+
+p3_penta1 <- make_dose_panel(cov_comm, "Penta 1")
+p3_penta2 <- make_dose_panel(cov_comm, "Penta 2")
+p3_penta3 <- make_dose_panel(cov_comm, "Penta 3")
+p3_mmr1   <- make_mmr_panel(cov_comm, "MMR 1")
+p3_mmr2   <- make_mmr_panel(cov_comm, "MMR 2")
+
+fig3 <- wrap_plots(
+  p3_penta1, p3_penta2, p3_penta3,
+  p3_mmr1,   p3_mmr2,   guide_area(),
+  ncol = 3
+) +
+  plot_layout(guides = "collect") +
+  plot_annotation(tag_levels = "A") &
+  theme(plot.tag = element_text(face = "bold"))
+
+fig3
+
+ggsave(
+  filename = here("output", "figures", "fig3_coverage_bycommunity.png"),
+  plot = fig3,
+  width = 260, height = 175, units = "mm", dpi = 300
+)
+cat("Figure 3 saved.\n")
+```
+
+---
+
+# Supplemental: pairwise community differences in seroprevalence by age
+
+*Supplemental / held in reserve.* For each pathogen, we estimate the marginal
+difference in seroprevalence between each pair of community types at each visit
+age. Models are fit with `geeglm` (linear probability model: gaussian family /
+identity link, so coefficients are differences in prevalence directly), with an
+independence working correlation and cluster-robust SEs clustered by child —
+consistent with the other inferential analyses. Because the community × age
+model is saturated, the point estimates equal the observed cell-proportion
+differences; the GEE supplies cluster-robust inference. Pairwise contrasts and
+95% CIs are obtained with `emmeans` (Tukey-adjusted across the three community
+pairs within each age).
+
+```{r supp-community-diffs}
+#-------------------------------
+# short labels for the 3 pairwise contrasts
+#-------------------------------
+contrast_recode <- c(
+  "Esmeraldas City - Borbon"         = "City − Borbon",
+  "Esmeraldas City - Rural Villages" = "City − Rural",
+  "Borbon - Rural Villages"          = "Borbon − Rural"
+)
+
+#-------------------------------
+# per-pathogen LPM GEE + pairwise community contrasts at each age
+#-------------------------------
+supp_notes <- character(0)
+diff_list <- list()
+for (pg in levels(d0$pathogen)) {
+  dat <- d0 %>%
+    filter(pathogen == pg, !is.na(seropos)) %>%
+    arrange(childid) %>%
+    mutate(cid = as.integer(factor(childid)), seropos = as.integer(seropos))
+
+  m <- withCallingHandlers(
+    geeglm(seropos ~ community_type_3 * timept_f, family = gaussian,
+           id = cid, corstr = "independence", data = dat),
+    warning = function(w) {
+      supp_notes[[length(supp_notes) + 1]] <<- sprintf("%s: %s", pg, conditionMessage(w))
+      invokeRestart("muffleWarning")
+    }
+  )
+
+  prs <- as.data.frame(
+    summary(pairs(emmeans(m, ~ community_type_3 | timept_f)), infer = c(TRUE, TRUE))
+  )
+
+  diff_list[[pg]] <- prs %>%
+    transmute(
+      pathogen = pg,
+      age      = as.character(timept_f),
+      contrast = contrast_recode[as.character(contrast)],
+      diff_pct = estimate * 100,
+      ci_lo    = lower.CL * 100,
+      ci_hi    = upper.CL * 100,
+      p_value  = p.value
+    )
+}
+
+diff_df <- bind_rows(diff_list) %>%
+  mutate(
+    pathogen     = factor(pathogen, levels = levels(d0$pathogen)),
+    contrast_lbl = factor(contrast, levels = c("City − Borbon", "City − Rural", "Borbon − Rural")),
+    age          = factor(age, levels = c("6", "9", "12", "18", "24")),
+    # set CI to NA when diff is 0 to suppress error bars in plot (just one point)
+    ci_lo        = ifelse(diff_pct == 0, NA, ci_lo),
+    ci_hi        = ifelse(diff_pct == 0, NA, ci_hi)
+  )
+
+#-------------------------------
+# save CSV (Table S1)
+#-------------------------------
+diff_csv <- diff_df %>%
+  transmute(
+    pathogen, age, contrast,
+    `Difference (95% CI), pct points` = sprintf("%.1f (%.1f, %.1f)", diff_pct, ci_lo, ci_hi),
+    p_value = if_else(p_value < 0.001, "<0.001", formatC(p_value, format = "g", digits = 3))
+  )
+write_csv(diff_csv, here("output", "tables", "tableS1_seroprev_diff_by_community.csv"))
+cat("Table S1 saved:", nrow(diff_csv), "rows (4 pathogens x 5 ages x 3 contrasts)\n")
+
+if (length(supp_notes) > 0) {
+  cat("GEE notes:\n"); for (n in supp_notes) cat(" -", n, "\n")
+} else {
+  cat("All supplemental GEE models fit without warnings.\n")
+}
+```
+
+```{r supp-forest, fig.width=9, fig.height=8}
+#-------------------------------
+# forest plot of pairwise differences, one panel per pathogen
+# (x = age; y = difference in prevalence; reference line at 0; CI crossing 0 = n.s.)
+#-------------------------------
+contrast_cols <- c("City − Borbon" = cbpal[2],
+                   "City − Rural"  = cbpal[3],
+                   "Borbon − Rural" = cbpal[8])
+
+# common y-axis range + 10-point breaks, harmonized across all four panels
+y_rng    <- range(c(diff_df$ci_lo, diff_df$ci_hi), na.rm = TRUE)
+y_lim    <- c(floor(y_rng[1] / 10) * 10, ceiling(y_rng[2] / 10) * 10)
+y_breaks <- seq(y_lim[1], y_lim[2], by = 10)
+
+# ylab supplied only for the left-column panels (A, C); B and D share the y-axis
+make_forest <- function(pg, ylab = NULL) {
+  diff_df %>%
+    filter(pathogen == pg) %>%
+    ggplot(aes(x = age, y = diff_pct, color = contrast_lbl)) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+    geom_pointrange(aes(ymin = ci_lo, ymax = ci_hi),
+                    position = position_dodge(width = 0.6), size = 0.3) +
+    scale_color_manual(values = contrast_cols, name = NULL) +
+    scale_y_continuous(breaks = y_breaks) +
+    coord_cartesian(ylim = y_lim) +
+    labs(x = "Age (months)", y = ylab, title = pg) +
+    theme_minimal() +
+    theme(panel.grid.minor = element_blank())
+}
+
+figS1 <- (make_forest("Tetanus", "Difference in seroprevalence (%)") | make_forest("Diphtheria")) /
+         (make_forest("Rubella", "Difference in seroprevalence (%)") | make_forest("Measles")) +
+  plot_layout(guides = "collect") +
+  plot_annotation(tag_levels = "A") &
+  theme(legend.position = "bottom", plot.tag = element_text(face = "bold"))
+
+figS1
+
+ggsave(
+  filename = here("output", "figures", "figS1_seroprev_diff_by_community.png"),
+  plot = figS1,
+  width = 220, height = 185, units = "mm", dpi = 300
+)
+cat("Figure S1 saved.\n")
+```
+
+---
+
+# Session information
+
+```{r session-info}
+sessionInfo()
+```
+

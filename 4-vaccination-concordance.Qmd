@@ -1,0 +1,364 @@
+---
+title: "Concordance Between Vaccination Records and Serology"
+author: "Stuart Torres, Ben Arnold"
+date: "Updated `r Sys.Date()`"
+format:
+  html:
+    toc: true
+    embed-resources: true
+    code-fold: true
+    link-external-newwindow: true
+---
+
+# Preamble
+
+```{r preamble, message=FALSE}
+library(here)
+source(here("R", "0-config.R"))
+```
+
+# Load and prepare data
+
+```{r load-data}
+#-------------------------------
+# read processed dataset
+#-------------------------------
+d0 <- read_rds(here("data", "ecomid_sero_vpd_2026-06-11.rds"))
+
+#-------------------------------
+# pathogen factor; collapse community type to 3 levels (for Table 9 strata)
+#-------------------------------
+d0 <- d0 %>%
+  mutate(
+    pathogen = factor(pathogen,
+                      levels = c("Tetanus", "Diphtheria", "Rubella", "Measles")),
+    community_type_3 = factor(
+      case_when(
+        community_name == "Esmeraldas" ~ "Esmeraldas City",
+        community_name == "Borbon"     ~ "Borbon",
+        TRUE                           ~ "Rural Villages"
+      ),
+      levels = c("Esmeraldas City", "Borbon", "Rural Villages"))
+  )
+
+#-------------------------------
+# define index-test "vaccinated" status per pathogen:
+#   received >= 1 dose of the relevant vaccine prior to DBS collection
+#   pentavalent (tetanus, diphtheria); MMR (rubella, measles)
+#-------------------------------
+d0 <- d0 %>%
+  mutate(
+    vac = case_when(
+      pathogen %in% c("Tetanus", "Diphtheria") ~ as.integer(penta_doses >= 1),
+      pathogen %in% c("Rubella", "Measles")    ~ as.integer(mmr_doses >= 1)
+    )
+  )
+
+cat("Vaccinated (>=1 dose) defined from penta_doses / mmr_doses.\n")
+```
+
+```{r gee-helpers}
+#-------------------------------
+# collect GEE convergence / estimability notes for the report
+#-------------------------------
+gee_notes <- character(0)
+
+#-------------------------------
+# helper: fit a GEE logistic model with an INDEPENDENCE working correlation
+# and cluster-robust (sandwich) SEs clustered by child (geeglm default).
+# data must contain an integer cluster id column `cid`, sorted by child.
+#-------------------------------
+fit_gee <- function(formula, data, tag) {
+  withCallingHandlers(
+    tryCatch(
+      geeglm(formula, family = binomial(link = "logit"),
+             id = cid, corstr = "independence", data = data),
+      error = function(e) {
+        gee_notes[[length(gee_notes) + 1]] <<-
+          sprintf("%s: GEE error: %s", tag, conditionMessage(e))
+        NULL
+      }
+    ),
+    warning = function(w) {
+      gee_notes[[length(gee_notes) + 1]] <<-
+        sprintf("%s: GEE warning: %s", tag, conditionMessage(w))
+      invokeRestart("muffleWarning")
+    }
+  )
+}
+
+#-------------------------------
+# helper: predicted probability + 95% cluster-robust CI for a linear
+# combination L of the GEE coefficients (Wald CI on the logit scale).
+#-------------------------------
+gee_pred_ci <- function(fit, L) {
+  b   <- coef(fit)
+  V   <- vcov(fit)                       # robust sandwich covariance (geeglm default)
+  eta <- as.numeric(L %*% b)
+  se  <- sqrt(as.numeric(t(L) %*% V %*% L))
+  c(est = plogis(eta), lo = plogis(eta - 1.96 * se), hi = plogis(eta + 1.96 * se))
+}
+
+#-------------------------------
+# helper: format a metric as "73.4% (60.1, 84.2)"
+# (the raw counts are already shown in the 2x2 columns, so no [n/N] here)
+#-------------------------------
+fmt_metric <- function(v) {
+  if (is.na(v["est"])) return("—")
+  sprintf("%.1f%% (%.1f, %.1f)",
+          v["est"] * 100, v["lo"] * 100, v["hi"] * 100)
+}
+
+#-------------------------------
+# helper: full concordance summary for one pathogen subset.
+#   serology (seropos) = gold standard; vaccination record (vac) = index test
+#
+#   sensitivity, specificity  <- model  vaccinated ~ seropos
+#   PPV, NPV                   <- model  seropos ~ vaccinated
+#   (specificity and NPV are the complements of the respective fitted cells)
+#-------------------------------
+concordance_row <- function(dat, label) {
+  dat <- dat %>%
+    filter(!is.na(seropos), !is.na(vac)) %>%
+    arrange(childid) %>%
+    mutate(cid = as.integer(factor(childid)),
+           seropos = as.integer(seropos),
+           vac = as.integer(vac))
+
+  TP <- sum(dat$vac == 1 & dat$seropos == 1)
+  FP <- sum(dat$vac == 1 & dat$seropos == 0)
+  FN <- sum(dat$vac == 0 & dat$seropos == 1)
+  TN <- sum(dat$vac == 0 & dat$seropos == 0)
+
+  na_vec <- c(est = NA, lo = NA, hi = NA)
+
+  # Model A: vaccinated ~ seropos  -> sensitivity, specificity
+  # specificity = complement of P(vaccinated | seronegative): flip CI bounds.
+  # as.numeric() strips inner names so c(est=, lo=, hi=) stays clean.
+  fitA <- fit_gee(vac ~ seropos, dat, paste(label, "sens/spec"))
+  if (!is.null(fitA)) {
+    sens <- gee_pred_ci(fitA, c(1, 1))                 # P(vac=1 | sero=1)
+    s0   <- gee_pred_ci(fitA, c(1, 0))                 # P(vac=1 | sero=0)
+    spec <- c(est = 1 - as.numeric(s0["est"]),
+              lo  = 1 - as.numeric(s0["hi"]),
+              hi  = 1 - as.numeric(s0["lo"]))
+  } else {
+    sens <- na_vec; spec <- na_vec
+  }
+
+  # Model B: seropos ~ vaccinated -> PPV, NPV
+  # NPV = complement of P(seropositive | not vaccinated): flip CI bounds.
+  fitB <- fit_gee(seropos ~ vac, dat, paste(label, "PPV/NPV"))
+  if (!is.null(fitB)) {
+    ppv <- gee_pred_ci(fitB, c(1, 1))                  # P(sero=1 | vac=1)
+    n0  <- gee_pred_ci(fitB, c(1, 0))                  # P(sero=1 | vac=0)
+    npv <- c(est = 1 - as.numeric(n0["est"]),
+             lo  = 1 - as.numeric(n0["hi"]),
+             hi  = 1 - as.numeric(n0["lo"]))
+  } else {
+    ppv <- na_vec; npv <- na_vec
+  }
+
+  # Overall agreement: P(record agrees with serology) = (TP + TN) / N,
+  # from an intercept-only GEE on the agreement indicator (same independence +
+  # cluster-robust SE approach as the other metrics).
+  N_tot <- TP + FP + FN + TN
+  datG  <- dat %>% mutate(agree = as.integer(vac == seropos))
+  fitG  <- fit_gee(agree ~ 1, datG, paste(label, "agreement"))
+  agr   <- if (!is.null(fitG)) gee_pred_ci(fitG, 1) else na_vec
+
+  tibble(
+    Group = label,
+    N = N_tot,
+    `TN (IgG-/Vac-)` = TN,
+    `FN (IgG+/Vac-)` = FN,
+    `FP (IgG-/Vac+)` = FP,
+    `TP (IgG+/Vac+)` = TP,
+    Agreement = fmt_metric(agr),
+    Sensitivity = fmt_metric(sens),
+    Specificity = fmt_metric(spec),
+    PPV = fmt_metric(ppv),
+    NPV = fmt_metric(npv),
+    small_cell = any(c(TP, FP, FN, TN) < 5)
+  )
+}
+```
+
+---
+
+# Table 8: Concordance across all four pathogens
+
+Serology is the gold standard; the vaccination record (≥ 1 dose received prior to
+the visit) is the index test. Tetanus and diphtheria use all visit ages; rubella
+and measles are restricted to the 12-, 18-, and 24-month visits (MMR not given
+earlier under Ecuador's national schedule). 95% CIs are from GEE logistic models
+with an independence working correlation and cluster-robust SEs clustered by child.
+
+```{r table8}
+#-------------------------------
+# track excluded observations (missing serology or vaccination status)
+#-------------------------------
+excl_summary <- tibble()
+t8_rows <- list()
+
+for (pg in levels(d0$pathogen)) {
+  dp <- d0 %>% filter(pathogen == pg)
+  if (pg %in% c("Rubella", "Measles")) {
+    dp <- dp %>% filter(timepoint %in% c(12, 18, 24))
+  }
+
+  n_before <- nrow(dp)
+  n_excl   <- sum(is.na(dp$seropos) | is.na(dp$vac))
+  excl_summary <- bind_rows(excl_summary,
+    tibble(Pathogen = pg, n_eligible = n_before,
+           n_excluded = n_excl, n_analyzed = n_before - n_excl))
+
+  t8_rows[[pg]] <- concordance_row(dp, pg) %>% rename(Pathogen = Group)
+}
+t8 <- bind_rows(t8_rows)
+
+cat("Observations excluded for missing serology or vaccination status:\n")
+print(as.data.frame(excl_summary), row.names = FALSE)
+cat("\nTotal excluded across pathogens:", sum(excl_summary$n_excluded), "\n")
+
+#-------------------------------
+# small-cell flag, save CSV, display
+#-------------------------------
+t8_display <- t8 %>%
+  mutate(Pathogen = if_else(small_cell, paste0(Pathogen, " †"), Pathogen)) %>%
+  select(-small_cell)
+
+write_csv(t8_display, here("output", "tables", "table8_concordance.csv"))
+cat("\nTable 8 saved.\n")
+
+t8_display %>%
+  gt() %>%
+  tab_header(
+    title = "Table 8. Concordance of vaccination record with serology",
+    subtitle = "Serology = gold standard; vaccination record (≥1 dose) = index test"
+  ) %>%
+  tab_spanner(label = "2×2 counts",
+              columns = c(`TN (IgG-/Vac-)`, `FN (IgG+/Vac-)`,
+                          `FP (IgG-/Vac+)`, `TP (IgG+/Vac+)`)) %>%
+  tab_spanner(label = "Diagnostic accuracy (% [n/N], 95% CI)",
+              columns = c(Agreement, Sensitivity, Specificity, PPV, NPV)) %>%
+  tab_footnote("% is the GEE point estimate (equals the crude proportion under the independence working correlation); 95% CIs are cluster-robust (sandwich), clustered by child. Sensitivity/specificity from model `vaccinated ~ seropos`; PPV/NPV from model `seropos ~ vaccinated`. Numerators/denominators for each metric are given by the 2×2 counts.") %>%
+  tab_footnote("Agreement = overall percent agreement between vaccination record and serology = (TP + TN) / N, from an intercept-only GEE on the agreement indicator.") %>%
+  tab_footnote("Rubella and measles restricted to 12-, 18-, and 24-month visits.") %>%
+  tab_footnote("† one or more 2×2 cells < 5; interpret with caution.")
+```
+
+---
+
+# Table 9: Measles vs. rubella seropositivity (12–24 months)
+
+Measles and rubella antigens are co-delivered in the MMR vaccine. Lower measles
+seropositivity than rubella among the same children could signal a problem with
+the heat-labile measles component (e.g., cold-chain failure). The comparison is
+shown overall and stratified by community type, at the 12-, 18-, and 24-month
+visits.
+
+```{r table9}
+#-------------------------------
+# data for the comparison: rubella + measles at 12/18/24m, non-missing seropos
+#-------------------------------
+dcmp <- d0 %>%
+  filter(pathogen %in% c("Rubella", "Measles"),
+         timepoint %in% c(12, 18, 24)) %>%
+  mutate(pathogen = factor(pathogen, levels = c("Rubella", "Measles")))
+
+n_excl_cmp <- sum(is.na(dcmp$seropos))
+dcmp <- dcmp %>% filter(!is.na(seropos)) %>% mutate(seropos = as.integer(seropos))
+
+cat("Child-visits (per pathogen) analyzed:", nrow(dcmp) / 2, "\n")
+cat("Unique children:", n_distinct(dcmp$childid), "\n")
+cat("Excluded for missing serology:", n_excl_cmp, "\n")
+
+#-------------------------------
+# helper: measles vs rubella comparison for one (sub)set —
+# per-pathogen seroprevalence (exact binomial CI) + GEE risk difference
+# (rubella - measles), independence + cluster-robust SE, marginalized via emmeans
+#-------------------------------
+mr_compare <- function(dat, label) {
+  dat <- dat %>% arrange(childid) %>% mutate(cid = as.integer(factor(childid)))
+
+  st <- dat %>%
+    group_by(pathogen) %>%
+    summarise(n_pos = sum(seropos), n_test = n(), .groups = "drop") %>%
+    rowwise() %>%
+    mutate(pct_ci = sprintf("%.1f%% (%.1f%% to %.1f%%)",
+                            n_pos / n_test * 100,
+                            binom.test(n_pos, n_test)$conf.int[1] * 100,
+                            binom.test(n_pos, n_test)$conf.int[2] * 100)) %>%
+    ungroup()
+
+  rd_str <- tryCatch({
+    fit <- geeglm(seropos ~ pathogen, family = binomial(link = "logit"),
+                  id = cid, corstr = "independence", data = dat)
+    rd  <- summary(pairs(regrid(emmeans(fit, ~ pathogen))), infer = c(TRUE, TRUE))
+    pf  <- if (rd$p.value < 0.001) "< 0.001" else paste("=", formatC(rd$p.value, format = "g", digits = 3))
+    sprintf("%.1f%% (%.1f, %.1f); p %s",
+            rd$estimate * 100, rd$lower.CL * 100, rd$upper.CL * 100, pf)
+  }, error = function(e) "not estimable")
+
+  tibble(
+    Stratum = label,
+    `Rubella N`          = st$n_test[st$pathogen == "Rubella"],
+    `Rubella % (95% CI)` = st$pct_ci[st$pathogen == "Rubella"],
+    `Measles N`          = st$n_test[st$pathogen == "Measles"],
+    `Measles % (95% CI)` = st$pct_ci[st$pathogen == "Measles"],
+    `Difference (Rubella − Measles)` = rd_str
+  )
+}
+
+#-------------------------------
+# overall + stratified by community type
+#-------------------------------
+t9 <- bind_rows(
+  mr_compare(dcmp, "Overall"),
+  mr_compare(dcmp %>% filter(community_type_3 == "Esmeraldas City"), "Esmeraldas City"),
+  mr_compare(dcmp %>% filter(community_type_3 == "Borbon"),          "Borbon"),
+  mr_compare(dcmp %>% filter(community_type_3 == "Rural Villages"),  "Rural Villages")
+)
+
+write_csv(t9, here("output", "tables", "table9_measles_rubella_comparison.csv"))
+cat("Table 9 saved.\n")
+
+t9 %>%
+  gt() %>%
+  tab_header(
+    title = "Table 9. Measles vs. rubella seropositivity (12–24 months)",
+    subtitle = "Same children, both antigens co-delivered in MMR"
+  ) %>%
+  tab_spanner(label = "Rubella", columns = c(`Rubella N`, `Rubella % (95% CI)`)) %>%
+  tab_spanner(label = "Measles", columns = c(`Measles N`, `Measles % (95% CI)`)) %>%
+  cols_label(
+    `Rubella N` = "N", `Rubella % (95% CI)` = "Seropositive % (95% CI)",
+    `Measles N` = "N", `Measles % (95% CI)` = "Seropositive % (95% CI)"
+  ) %>%
+  tab_footnote("N = number of child-visits tested; Seropositive % with 95% exact binomial CI. Difference: risk difference (rubella − measles) from a GEE logistic model (independence working correlation, cluster-robust SEs by child), marginalized to the probability scale; 95% CI and p-value shown.") %>%
+  tab_footnote("Measles and rubella are measured on the same DBS at each visit (paired; within-child-visit seropositivity correlation ≈ 0.73). Clustering on child means the cluster-robust SE already accounts for this pairing — it matches a paired (McNemar) analysis — so no separate paired test is needed.")
+```
+
+---
+
+# GEE model notes
+
+```{r gee-notes}
+if (length(gee_notes) == 0) {
+  cat("All GEE models converged with no warnings or estimability issues.\n")
+} else {
+  cat("GEE model notes (", length(gee_notes), "):\n", sep = "")
+  for (nt in gee_notes) cat(" -", nt, "\n")
+}
+```
+
+---
+
+# Session information
+
+```{r session-info}
+# print and also save session info (reporting convention, spec §6)
+writeLines(capture.output(sessionInfo()), here("output", "session_info.txt"))
+sessionInfo()
+```
